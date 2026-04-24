@@ -19,16 +19,25 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
 
+from prctl import notes
+
 app = typer.Typer(
     help="prctl — PR-workflow helper.",
     no_args_is_help=True,
 )
+
+notes_app = typer.Typer(
+    help="Local PR notes — context that survives between review sessions.",
+    no_args_is_help=True,
+)
+app.add_typer(notes_app, name="notes")
 
 
 @app.callback()
@@ -412,6 +421,13 @@ def cmd_queue(
             help="comma-separated owner/name list; defaults to $PRCTL_DEFAULT_REPOS",
         ),
     ] = _DEFAULT_REPOS,
+    with_notes: Annotated[
+        bool,
+        typer.Option(
+            "--with-notes",
+            help="Attach a condensed local note (intent, open threads, last session) to each PR entry.",
+        ),
+    ] = False,
 ) -> None:
     """Categorize open PRs (not authored by the caller) into review buckets."""
     if not repos:
@@ -468,6 +484,12 @@ def cmd_queue(
             summary["last_commit"] = last_commit
             summary["last_caller_feedback"] = last_feedback
             buckets[bucket].append(summary)
+
+    if with_notes:
+        for entries in buckets.values():
+            for entry in entries:
+                note = notes.try_load_note(entry["repo"], entry["number"])
+                entry["notes"] = notes.compact_for_queue(note)
 
     _emit({**buckets, "flags": flags})
 
@@ -793,6 +815,100 @@ def cmd_comments(repo: REPO_OPT = None, pr: PR_OPT = None) -> None:
         )
 
     _emit(out)
+
+
+# ---------- notes subsystem ----------
+
+_NOTES_REPO_OPT = Annotated[str, typer.Option("--repo", help="owner/name")]
+_NOTES_PR_OPT = Annotated[int, typer.Option("--pr", help="PR number")]
+
+
+def _read_or_stdin(spec: str) -> str:
+    """``-`` → stdin, ``@path`` → file, anything else → literal string."""
+    if spec == "-":
+        return sys.stdin.read()
+    if spec.startswith("@"):
+        return Path(spec[1:]).read_text(encoding="utf-8")
+    return spec
+
+
+@notes_app.command("get")
+def cmd_notes_get(repo: _NOTES_REPO_OPT, pr: _NOTES_PR_OPT) -> None:
+    """Print the note for a PR (empty-note skeleton if no file exists)."""
+    _emit(notes.get_note(repo, pr))
+
+
+@notes_app.command("set")
+def cmd_notes_set(
+    repo: _NOTES_REPO_OPT,
+    pr: _NOTES_PR_OPT,
+    summary_sha: Annotated[str, typer.Option("--summary-sha", help="head SHA the intent was derived from")],
+    summary_intent: Annotated[
+        str, typer.Option("--summary-intent", help="one-paragraph description of what the PR does")
+    ],
+    summary_scope: Annotated[
+        list[str] | None,
+        typer.Option("--summary-scope", help="repeat for each scope item"),
+    ] = None,
+) -> None:
+    """Set or replace the PR summary block."""
+    _emit(notes.set_summary(repo, pr, sha=summary_sha, intent=summary_intent, scope=summary_scope))
+
+
+@notes_app.command("append")
+def cmd_notes_append(
+    repo: _NOTES_REPO_OPT,
+    pr: _NOTES_PR_OPT,
+    session: Annotated[
+        str,
+        typer.Option("--session", help="session JSON; '-' reads stdin, '@path' reads file"),
+    ],
+) -> None:
+    """Append a review session record."""
+    data = json.loads(_read_or_stdin(session))
+    _emit(notes.append_session(repo, pr, data))
+
+
+@notes_app.command("track-thread")
+def cmd_notes_track_thread(
+    repo: _NOTES_REPO_OPT,
+    pr: _NOTES_PR_OPT,
+    thread_id: Annotated[str, typer.Option("--thread-id")],
+    note_text: Annotated[str, typer.Option("--note", help="what addressing this thread should look like")],
+    sha: Annotated[str, typer.Option("--sha", help="head SHA at time of record")],
+) -> None:
+    """Track a review thread we're waiting on the author to address."""
+    _emit(notes.track_thread(repo, pr, thread_id=thread_id, note_text=note_text, sha=sha))
+
+
+@notes_app.command("untrack-thread")
+def cmd_notes_untrack_thread(
+    repo: _NOTES_REPO_OPT,
+    pr: _NOTES_PR_OPT,
+    thread_id: Annotated[str, typer.Option("--thread-id")],
+) -> None:
+    """Stop tracking a thread (e.g. after it's been addressed)."""
+    _emit(notes.untrack_thread(repo, pr, thread_id=thread_id))
+
+
+@notes_app.command("list")
+def cmd_notes_list(
+    repo: Annotated[str | None, typer.Option("--repo", help="filter by owner/name")] = None,
+) -> None:
+    """List PR notes on disk (optionally filtered to one repo)."""
+    _emit(notes.list_notes(repo))
+
+
+@notes_app.command("path")
+def cmd_notes_path(repo: _NOTES_REPO_OPT, pr: _NOTES_PR_OPT) -> None:
+    """Print the absolute path to a PR's note file (not JSON — plain string for piping)."""
+    typer.echo(str(notes.note_path(repo, pr)))
+
+
+@notes_app.command("migrate")
+def cmd_notes_migrate() -> None:
+    """Placeholder for future schema migrations. No-op at the current version."""
+    _emit({"schema_version": notes.SCHEMA_VERSION, "migrated": 0})
 
 
 if __name__ == "__main__":

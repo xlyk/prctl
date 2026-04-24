@@ -20,6 +20,8 @@ description: Use when invoking the `prctl` CLI to operate on GitHub PRs — fetc
 - `prctl safe-merge <pr>` — children-aware squash-merge
 - `prctl rebase-onto-main [--old-base <sha>]`
 - `prctl ci-wait <pr> [--timeout 600] [--interval 30]` — poll `statusCheckRollup` until green / failing / timeout
+- `prctl notes {get,set,append,track-thread,untrack-thread,list,path,migrate}` — local per-PR notebook (intent, awaiting-author threads, session log)
+- `prctl queue --with-notes` — attach condensed local notes to each PR entry in one call
 
 ## When NOT to reach for it
 
@@ -116,6 +118,60 @@ Bucketing rules:
 
 Exit code mirrors `state`: 0 green, 1 failing, 2 timeout. Defaults: `--timeout 600` (10m), `--interval 30` seconds. Use inside a merge flow to gate on CI without agent-side polling loops.
 
+### `notes` subsystem
+
+One JSON file per PR at `~/.config/prctl/notes/<owner>__<repo>__<pr>.json`. Override the root with `$PRCTL_NOTES_ROOT`. Atomic writes (tmp + rename); single-writer by design — no locking.
+
+Schema (`schema_version: 1`):
+
+```json
+{
+  "schema_version": 1,
+  "pr": "owner/repo#123",
+  "created_at": "2026-04-24T18:20:00+00:00",
+  "updated_at": "2026-04-24T18:20:00+00:00",
+  "summary": {
+    "sha": "<sha the intent was derived from>",
+    "intent": "one-paragraph description of what the PR does",
+    "scope": ["file/area", "..."]
+  },
+  "awaiting_author_on": [
+    {"thread_id": "PRRT_xxx", "note": "what fixing this looks like",
+     "sha_at_record": "...", "recorded_at": "..."}
+  ],
+  "sessions": [
+    {
+      "id": "sess_abc123",
+      "ts": "...",
+      "head_sha": "...",
+      "posted": [{"path": "...", "line": 42, "body": "...", "thread_id": "PRRT_...", "review_id": 12345}],
+      "dropped": [{"finding": "short subject", "reason": "why I didn't post it"}],
+      "user_verdict": "free-form string"
+    }
+  ]
+}
+```
+
+Subcommands:
+
+- `prctl notes get --repo <o/r> --pr <N>` → full JSON (empty-note skeleton if no file exists). Skeletons are NOT written to disk.
+- `prctl notes set --repo <o/r> --pr <N> --summary-sha <sha> --summary-intent "..." [--summary-scope X]...` → `{path}`. Replaces the summary block.
+- `prctl notes append --repo <o/r> --pr <N> --session <spec>` → `{session_id, path}`. `<spec>` is JSON literal, `-` for stdin, or `@path` to read a file. Session body is free-form; known keys: `id`, `ts`, `head_sha`, `posted`, `dropped`, `user_verdict`.
+- `prctl notes track-thread --repo <o/r> --pr <N> --thread-id <tid> --note "..." --sha <sha>` — re-tracking a thread replaces the prior entry.
+- `prctl notes untrack-thread --repo <o/r> --pr <N> --thread-id <tid>` → `{removed: bool}`. Idempotent.
+- `prctl notes list [--repo <o/r>]` → `[{pr, updated_at, open_threads, last_session_sha, last_session_ts, summary_sha}]`.
+- `prctl notes path --repo <o/r> --pr <N>` — prints absolute path as plain text (not JSON) so it can be piped to `$EDITOR`.
+- `prctl notes migrate` — no-op at schema v1; reserved for future bumps.
+
+`queue --with-notes` adds a `notes` key to each bucket entry:
+
+```json
+{"intent": "...", "intent_sha": "...", "awaiting_count": 2,
+ "last_session_sha": "...", "last_session_ts": "..."}
+```
+
+or `null` when no note exists for that PR. Without the flag, `notes` is omitted entirely (backwards-compatible).
+
 ## Gotchas
 
 - **HEAD-side line numbers.** Every `line` / `start_line` in a review payload MUST be an absolute line number at the PR's HEAD, not a diff-hunk position. Use `prctl diff-lines` to enumerate valid lines before drafting — GitHub rejects out-of-diff comments.
@@ -125,6 +181,9 @@ Exit code mirrors `state`: 0 green, 1 failing, 2 timeout. Defaults: `--timeout 6
 - **`reply --body` preserves Unicode.** Body goes through `gh api -f body=...`; em-dashes, fancy quotes, and non-ASCII survive.
 - **Pagination is automatic.** `comments` and `queue` use `gh --paginate`, so multi-page reviews/comments are not lost.
 - **JSON only.** No human-mode rendering yet. Parse with `jq` or `json.loads`.
+- **Notes are local-only.** `~/.config/prctl/notes/` does not sync across hosts. Cloud Claude sessions can't read a desktop's notes. Treat notes as hints, not gospel — always check `summary.sha` against current HEAD before quoting the intent.
+- **Notes write on almost every call.** `set`, `append`, `track-thread`, `untrack-thread` always write (even when it's effectively a no-op, to refresh `updated_at`). `get` and `list` are pure reads.
+- **Unknown `schema_version` errors out.** `get`/`list` refuse to read files with a different version than the current one — delete the file or run `prctl notes migrate` when that lands.
 
 ## Common patterns
 
@@ -151,6 +210,16 @@ Exit code mirrors `state`: 0 green, 1 failing, 2 timeout. Defaults: `--timeout 6
 1. `prctl stack --repo o/r --seed 123` — get bottom-to-top order.
 2. For each PR: switch branch, `prctl rebase-onto-main` (optionally with `--old-base` if parent was just merged), `prctl ci-wait <pr>`, then (after a merge gate) `prctl safe-merge <pr>`.
 
+### Recall prior context for a PR
+
+1. `prctl notes get --repo o/r --pr N` — read `summary.intent` to re-engage fast; inspect `awaiting_author_on` to see which threads you expected to be addressed and what "addressed" looks like; scan `sessions[-1].user_verdict` for the last directive the user gave.
+2. If `summary.sha` is far behind current HEAD, treat the intent as a hint and re-verify before acting.
+3. After a new review session, `prctl notes append --session @session.json` to record posted/dropped findings and the user verdict; `prctl notes track-thread` per posted comment you're waiting on.
+
+### Annotate the queue with prior context
+
+`prctl queue --repos o/r1,o/r2 --with-notes` — each bucket entry gains a condensed `notes` view (intent, open-thread count, last-session SHA/ts) so a rendering pass can flag "intent unchanged since last review" or "N threads still open" inline without N additional calls.
+
 ## Mutating subcommands do NOT gate
 
 These subcommands make visible, hard-to-undo changes to GitHub. They do not prompt, do not preview, and do not confirm. The caller is responsible for gating every one of them behind an AskUserQuestion (or equivalent) approval, and for previewing the content verbatim in chat before asking.
@@ -161,7 +230,7 @@ These subcommands make visible, hard-to-undo changes to GitHub. They do not prom
 - `prctl safe-merge` — squash-merges and may delete the branch. Call only after an explicit merge gate.
 - `prctl rebase-onto-main` — rewrites branch history and will need a `--force-with-lease` push afterwards. Don't run on someone else's branch or mid-review.
 
-Read-only subcommands (`comments`, `diff-lines`, `queue`, `stack`, `validate-review`, `ci-wait`) do not need approval.
+Read-only subcommands (`comments`, `diff-lines`, `queue`, `stack`, `validate-review`, `ci-wait`, `notes get`, `notes list`, `notes path`) do not need approval. `notes set`, `notes append`, `notes track-thread`, `notes untrack-thread` only touch the local filesystem — no approval gate needed, but prefer to only record facts the user has already seen.
 
 ## Not handled by prctl
 
