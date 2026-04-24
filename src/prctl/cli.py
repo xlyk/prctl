@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -258,6 +259,16 @@ def _post_reply(full_repo: str, number: int, comment_id: int, body: str) -> int:
     return int(json.loads(result.stdout)["id"])
 
 
+def _resolve_thread_once(thread_id: str) -> None:
+    mutation = "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id isResolved}}}"
+    subprocess.run(
+        ["gh", "api", "graphql", "-f", f"query={mutation}", "-F", f"id={thread_id}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
 @app.command("reply")
 def cmd_reply(
     repo: REPO_OPT = None,
@@ -266,18 +277,24 @@ def cmd_reply(
     body: Annotated[str | None, typer.Option("--body")] = None,
     batch: Annotated[Path | None, typer.Option("--batch", help="path to JSON batch file")] = None,
 ) -> None:
-    """Post one inline reply or a batch."""
+    """Post one inline reply or a batch. Batch entries may carry a ``resolve`` field
+    (thread node ID) to resolve the thread atomically after the reply lands."""
     full_repo, number = _resolve_pr(repo, pr)
     posted: list[int] = []
+    resolved: list[str] = []
     if batch is not None:
         entries = json.loads(batch.read_text())
         for entry in entries:
             posted.append(_post_reply(full_repo, number, int(entry["comment_id"]), entry["body"]))
+            thread_id = entry.get("resolve")
+            if thread_id:
+                _resolve_thread_once(str(thread_id))
+                resolved.append(str(thread_id))
     else:
         if comment_id is None or body is None:
             raise typer.BadParameter("pass --comment-id + --body, or --batch")
         posted.append(_post_reply(full_repo, number, comment_id, body))
-    _emit({"posted": posted})
+    _emit({"posted": posted, "resolved": resolved})
 
 
 @app.command("resolve-thread")
@@ -557,6 +574,77 @@ def cmd_stack(
             for p in chain
         ]
     )
+
+
+def _poll_checks(repo: str, pr_number: int) -> list[str]:
+    """Return a deduped list of status-check conclusions (upper-cased)."""
+    result = subprocess.run(
+        ["gh", "pr", "view", "--repo", repo, str(pr_number), "--json", "statusCheckRollup"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    rollup = json.loads(result.stdout).get("statusCheckRollup", []) or []
+    out: list[str] = []
+    for entry in rollup:
+        # pending checks carry a ``status`` (IN_PROGRESS / QUEUED / PENDING) and no conclusion yet
+        value = entry.get("conclusion") or entry.get("status") or entry.get("state")
+        if value:
+            out.append(str(value).upper())
+    return out
+
+
+@app.command("ci-wait")
+def cmd_ci_wait(
+    pr_number: Annotated[int, typer.Argument()],
+    repo: REPO_OPT = None,
+    timeout: Annotated[int, typer.Option("--timeout", help="seconds")] = 600,
+    interval: Annotated[int, typer.Option("--interval", help="seconds between polls")] = 30,
+) -> None:
+    """Poll CI for a PR. Exit 0 green, 1 failing, 2 timeout."""
+    full_repo = repo or _resolve_pr(None, None)[0]
+    deadline = time.monotonic() + timeout
+    while True:
+        checks = _poll_checks(full_repo, pr_number)
+        fail = [c for c in checks if c in _FAIL_CONCLUSIONS]
+        pending = [c for c in checks if c not in _PASS_CONCLUSIONS | _FAIL_CONCLUSIONS]
+        if fail:
+            _emit(
+                {
+                    "state": "failing",
+                    "checks": {
+                        "pass": [c for c in checks if c in _PASS_CONCLUSIONS],
+                        "fail": fail,
+                        "pending": pending,
+                    },
+                }
+            )
+            raise typer.Exit(code=1)
+        if not pending:
+            _emit(
+                {
+                    "state": "green",
+                    "checks": {
+                        "pass": [c for c in checks if c in _PASS_CONCLUSIONS],
+                        "fail": [],
+                        "pending": [],
+                    },
+                }
+            )
+            return
+        if time.monotonic() >= deadline:
+            _emit(
+                {
+                    "state": "timeout",
+                    "checks": {
+                        "pass": [c for c in checks if c in _PASS_CONCLUSIONS],
+                        "fail": [],
+                        "pending": pending,
+                    },
+                }
+            )
+            raise typer.Exit(code=2)
+        time.sleep(interval)
 
 
 @app.command("safe-merge")

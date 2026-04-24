@@ -19,6 +19,7 @@ description: Use when invoking the `prctl` CLI to operate on GitHub PRs — fetc
 - `prctl stack [--repo o/r] [--seed <pr|branch>]` — bottom-to-top stack chain
 - `prctl safe-merge <pr>` — children-aware squash-merge
 - `prctl rebase-onto-main [--old-base <sha>]`
+- `prctl ci-wait <pr> [--timeout 600] [--interval 30]` — poll `statusCheckRollup` until green / failing / timeout
 
 ## When NOT to reach for it
 
@@ -76,9 +77,9 @@ Review payload shape required:
 
 Multi-line: include `start_line` + `start_side: "RIGHT"`. Keep top-level `body` empty unless there's a cross-cutting architectural point.
 
-### `reply` → `{"posted": [id, ...]}`
+### `reply` → `{"posted": [id, ...], "resolved": [thread_id, ...]}`
 
-Batch file shape: `[{"comment_id": 123, "body": "..."}, ...]`.
+Batch file shape: `[{"comment_id": 123, "body": "...", "resolve": "PRRT_xxx"?}, ...]`. `resolve` is optional per entry — when present, the thread is resolved immediately after the reply lands. `resolved` in the output lists the thread IDs that were resolved.
 
 ### `resolve-thread` → `{"thread_id", "state": "resolved" | "open"}`
 
@@ -111,6 +112,10 @@ Bucketing rules:
 
 ### `rebase-onto-main` → `{strategy: "plain" | "onto", old_base, head_after}`
 
+### `ci-wait` → `{state: "green" | "failing" | "timeout", checks: {pass, fail, pending}}`
+
+Exit code mirrors `state`: 0 green, 1 failing, 2 timeout. Defaults: `--timeout 600` (10m), `--interval 30` seconds. Use inside a merge flow to gate on CI without agent-side polling loops.
+
 ## Gotchas
 
 - **HEAD-side line numbers.** Every `line` / `start_line` in a review payload MUST be an absolute line number at the PR's HEAD, not a diff-hunk position. Use `prctl diff-lines` to enumerate valid lines before drafting — GitHub rejects out-of-diff comments.
@@ -134,17 +139,33 @@ Bucketing rules:
 
 1. `prctl comments --repo o/r --pr N > comments.json` — triage against current file state at HEAD.
 2. Make fixes, commit, push.
-3. Build `replies.json = [{"comment_id": X, "body": "fixed — ..."}, ...]`.
-4. `prctl reply --repo o/r --pr N --batch replies.json`.
-5. For each fixed thread: `prctl resolve-thread <thread_id>`.
+3. Build `replies.json` — one entry per approved reply; add `"resolve": "<thread_id>"` to entries whose thread should be resolved:
+   ```json
+   [{"comment_id": 123, "body": "fixed — ...", "resolve": "PRRT_abc"},
+    {"comment_id": 456, "body": "declined — out of scope"}]
+   ```
+4. `prctl reply --repo o/r --pr N --batch replies.json` — posts replies and resolves threads atomically in one pass.
 
 ### Walk a stack
 
 1. `prctl stack --repo o/r --seed 123` — get bottom-to-top order.
-2. For each PR: switch branch, `prctl rebase-onto-main` (optionally with `--old-base` if parent was just merged), wait for CI, then `prctl safe-merge <pr>`.
+2. For each PR: switch branch, `prctl rebase-onto-main` (optionally with `--old-base` if parent was just merged), `prctl ci-wait <pr>`, then (after a merge gate) `prctl safe-merge <pr>`.
+
+## Mutating subcommands do NOT gate
+
+These subcommands make visible, hard-to-undo changes to GitHub. They do not prompt, do not preview, and do not confirm. The caller is responsible for gating every one of them behind an AskUserQuestion (or equivalent) approval, and for previewing the content verbatim in chat before asking.
+
+- `prctl post-review` — posts a review with inline comments. Every `(path, line, body)` must be approved first.
+- `prctl reply` / `prctl reply --batch` — posts inline replies. Every reply body must be approved first. If the batch file contains entries the user did not approve, they WILL be posted — construct the batch file from the approved set only.
+- `prctl resolve-thread` — resolves a GitHub review thread. Only call for comments the user confirmed are actually fixed.
+- `prctl safe-merge` — squash-merges and may delete the branch. Call only after an explicit merge gate.
+- `prctl rebase-onto-main` — rewrites branch history and will need a `--force-with-lease` push afterwards. Don't run on someone else's branch or mid-review.
+
+Read-only subcommands (`comments`, `diff-lines`, `queue`, `stack`, `validate-review`, `ci-wait`) do not need approval.
 
 ## Not handled by prctl
 
 - AskUserQuestion gates — the calling workflow owns approval.
+- Verbatim comment previews with current-HEAD code snippets — `prctl comments` returns the body but NOT the source at that line. Agent must `Read` the file to show the current code.
 - Force-with-lease push, pytest, pre-commit — run directly.
 - Writing review/reply/PR prose — agent judgment.

@@ -26,11 +26,17 @@ class _Canned:
 class FakeProc:
     """Registers canned subprocess responses by argv prefix.
 
+    - ``register`` installs a single response that serves every matching call.
+    - ``register_seq`` installs a FIFO queue of responses for argv that gets
+      polled multiple times (e.g. ``ci-wait``). Each matching call consumes
+      the next response; over-consumption raises.
+
     Matching is longest-prefix-wins so specific registrations beat generic ones.
     Unknown argv raises loudly — better than silently returning empty output.
     """
 
     responses: list[tuple[tuple[str, ...], _Canned]] = field(default_factory=list)
+    sequences: list[tuple[tuple[str, ...], list[_Canned]]] = field(default_factory=list)
     calls: list[list[str]] = field(default_factory=list)
 
     def register(
@@ -43,7 +49,29 @@ class FakeProc:
     ) -> None:
         self.responses.append((tuple(argv_prefix), _Canned(stdout=stdout, stderr=stderr, returncode=returncode)))
 
+    def register_seq(
+        self,
+        argv_prefix: Iterable[str],
+        responses: list[dict[str, object]],
+    ) -> None:
+        queue = [
+            _Canned(
+                stdout=str(r.get("stdout", "")),
+                stderr=str(r.get("stderr", "")),
+                returncode=int(r.get("returncode", 0)),
+            )
+            for r in responses
+        ]
+        self.sequences.append((tuple(argv_prefix), queue))
+
     def _match(self, argv: list[str]) -> _Canned:
+        # sequences win over singletons when both match; consume FIFO
+        best_seq: tuple[int, list[_Canned]] | None = None
+        for prefix, queue in self.sequences:
+            if tuple(argv[: len(prefix)]) == prefix and queue and (best_seq is None or len(prefix) > best_seq[0]):
+                best_seq = (len(prefix), queue)
+        if best_seq is not None:
+            return best_seq[1].pop(0)
         best: tuple[int, _Canned] | None = None
         for prefix, canned in self.responses:
             if tuple(argv[: len(prefix)]) == prefix and (best is None or len(prefix) > best[0]):
