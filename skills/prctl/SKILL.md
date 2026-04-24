@@ -98,13 +98,15 @@ Batch file shape: `[{"comment_id": 123, "body": "...", "resolve": "PRRT_xxx"?}, 
 }
 ```
 
-Each entry: `{repo, number, title, author, head, review_decision, mergeable, checks: {pass, fail, pending}, last_commit, last_caller_feedback}`.
+Each entry: `{repo, number, title, author, head, review_decision, mergeable, checks: {pass, fail, pending}, last_commit, last_caller_feedback, unresolved_caller_threads}`.
+
+`unresolved_caller_threads` is the count of review threads the caller commented on that are still open (`isResolved == false` AND `isOutdated == false`). Outdated threads are treated as addressed — the code the comment anchored to has moved.
 
 Bucketing rules:
 - `ready_merge`: `reviewDecision == "APPROVED"` AND `mergeable == "MERGEABLE"` AND no failing checks.
 - `initial_review`: caller has never reviewed/commented.
-- `another_round`: caller reviewed, but last commit is newer than caller's last feedback.
-- `awaiting_author`: caller's feedback is newer than last commit.
+- `another_round`: caller reviewed, last commit is newer than caller's last feedback, AND `unresolved_caller_threads > 0`.
+- `awaiting_author`: caller's feedback is newer than last commit — OR new commits landed but every caller thread is already resolved/outdated (nothing actionable left).
 
 ### `stack` → `list`
 

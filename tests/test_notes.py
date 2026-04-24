@@ -293,6 +293,10 @@ def test_queue_with_notes_attaches_compact(
         ("gh", "api", "--paginate", "repos/foo/bar/pulls/42/comments"),
         stdout=json.dumps([]),
     )
+    fake_proc.register(
+        ("gh", "api", "graphql"),
+        stdout=json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}}),
+    )
 
     notes.set_summary("foo/bar", 42, sha="aaa", intent="the gist", scope=[])
     notes.track_thread("foo/bar", 42, thread_id="PRRT_1", note_text="fix x", sha="aaa")
@@ -333,6 +337,10 @@ def test_queue_without_notes_flag_omits_notes_key(
         ("gh", "api", "--paginate", "repos/foo/bar/pulls/42/comments"),
         stdout=json.dumps([]),
     )
+    fake_proc.register(
+        ("gh", "api", "graphql"),
+        stdout=json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}}),
+    )
 
     notes.set_summary("foo/bar", 42, sha="aaa", intent="the gist")
 
@@ -364,6 +372,10 @@ def test_queue_with_notes_null_when_no_note(
     fake_proc.register(
         ("gh", "api", "--paginate", "repos/foo/bar/pulls/42/comments"),
         stdout=json.dumps([]),
+    )
+    fake_proc.register(
+        ("gh", "api", "graphql"),
+        stdout=json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}}),
     )
 
     runner = CliRunner()

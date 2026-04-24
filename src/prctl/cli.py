@@ -145,11 +145,17 @@ def categorize_pr(
     *,
     last_commit: str | None,
     last_caller_feedback: str | None,
+    unresolved_caller_threads: int | None = None,
 ) -> str:
     """Decide which bucket a PR belongs to. Pure — no I/O.
 
     Returns one of: ``ready_merge``, ``initial_review``, ``another_round``,
     ``awaiting_author``.
+
+    When ``unresolved_caller_threads`` is supplied and is 0, a PR that would
+    otherwise land in ``another_round`` is demoted to ``awaiting_author`` —
+    the new commits didn't leave any caller thread unresolved, so there is
+    nothing actionable for the caller.
     """
     checks = pr.get("statusCheckRollup_conclusions") or []
     ci_pass = all(c in _PASS_CONCLUSIONS for c in checks)
@@ -161,8 +167,53 @@ def categorize_pr(
     if last_caller_feedback is None:
         return "initial_review"
     if last_commit is not None and last_commit > last_caller_feedback:
+        if unresolved_caller_threads == 0:
+            return "awaiting_author"
         return "another_round"
     return "awaiting_author"
+
+
+def _unresolved_caller_threads(owner: str, name: str, number: int, caller: str) -> int:
+    """Count review threads where ``caller`` commented and the thread is still open.
+
+    A thread is counted iff: (a) at least one comment is authored by ``caller``,
+    (b) ``isResolved`` is false, and (c) ``isOutdated`` is false. Outdated threads
+    are treated as implicitly addressed — the code the comment anchored to has
+    since moved.
+    """
+    query = (
+        "query($o:String!,$n:String!,$num:Int!){"
+        "repository(owner:$o,name:$n){pullRequest(number:$num){"
+        "reviewThreads(first:100){nodes{isResolved isOutdated "
+        "comments(first:50){nodes{author{login}}}}}"
+        "}}}"
+    )
+    argv = [
+        "gh",
+        "api",
+        "graphql",
+        "-f",
+        f"query={query}",
+        "-F",
+        f"o={owner}",
+        "-F",
+        f"n={name}",
+        "-F",
+        f"num={number}",
+    ]
+    result = subprocess.run(argv, capture_output=True, text=True, check=True)
+    payload = json.loads(result.stdout)
+    nodes = (
+        payload.get("data", {}).get("repository", {}).get("pullRequest", {}).get("reviewThreads", {}).get("nodes", [])
+    ) or []
+    count = 0
+    for thread in nodes:
+        if thread.get("isResolved") or thread.get("isOutdated"):
+            continue
+        authors = {(c.get("author") or {}).get("login") for c in (thread.get("comments") or {}).get("nodes", []) or []}
+        if caller in authors:
+            count += 1
+    return count
 
 
 def _parse_unified_diff(diff_text: str) -> dict[str, list[int]]:
@@ -476,13 +527,17 @@ def cmd_queue(
 
             last_commit = _last_commit_date(repo, pr["number"])
             last_feedback = _last_caller_feedback(repo, pr["number"], caller)
+            owner, name = repo.split("/", 1)
+            unresolved = _unresolved_caller_threads(owner, name, pr["number"], caller)
             bucket = categorize_pr(
                 pr_with_checks,
                 last_commit=last_commit,
                 last_caller_feedback=last_feedback,
+                unresolved_caller_threads=unresolved,
             )
             summary["last_commit"] = last_commit
             summary["last_caller_feedback"] = last_feedback
+            summary["unresolved_caller_threads"] = unresolved
             buckets[bucket].append(summary)
 
     if with_notes:
