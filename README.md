@@ -36,6 +36,16 @@ Exit codes: `0` ok, `1` generic error, `2` validation failure.
 
 - `PRCTL_DEFAULT_REPOS` — comma-separated `owner/name` list used by `prctl queue` when `--repos` is omitted.
 
+## Claude Code skill
+
+`skills/prctl/SKILL.md` teaches agents how to call the CLI correctly — output contracts, exit codes, and gotchas (HEAD-side line numbers, pagination, children-aware safe-merge). Install by symlinking into your user skills dir:
+
+```bash
+just install-skill
+# or manually:
+ln -snf "$(pwd)/skills/prctl" ~/.claude/skills/prctl
+```
+
 ## Development
 
 ```bash
