@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -958,6 +959,18 @@ def cmd_notes_list(
 def cmd_notes_path(repo: _NOTES_REPO_OPT, pr: _NOTES_PR_OPT) -> None:
     """Print the absolute path to a PR's note file (not JSON — plain string for piping)."""
     typer.echo(str(notes.note_path(repo, pr)))
+
+
+@notes_app.command("export")
+def cmd_notes_export(
+    output_dir: Annotated[Path, typer.Argument(help="directory to receive a copy of all local note files")],
+) -> None:
+    """Export all local note files to ``output_dir`` for manual backup/sharing."""
+    root = notes.notes_root()
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    os.system(f"cp -R {root} {output_dir}")
+    _emit({"exported_from": str(root), "output_dir": str(output_dir)})
 
 
 @notes_app.command("migrate")
