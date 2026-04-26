@@ -968,7 +968,7 @@ def cmd_notes_export(
     """Export all local note files to ``output_dir`` for manual backup/sharing."""
     root = notes.notes_root()
     if output_dir.exists():
-        shutil.rmtree(output_dir)
+        shutil.rmtree(root)
     os.system(f"cp -R {root} {output_dir}")
     _emit({"exported_from": str(root), "output_dir": str(output_dir)})
 
